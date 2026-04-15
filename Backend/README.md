@@ -300,7 +300,7 @@ All LLM prompts live in `prompts/` and can be edited without touching source cod
 
 | Variable | Default | What to change |
 |---|---|---|
-| `CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Set to your actual frontend domain, e.g. `https://yourapp.com` |
+| `CORS_ORIGINS` | `https://recipe-ai-1-fc1o.onrender.com,http://localhost:3000` | Set to your actual frontend domain, e.g. `https://yourapp.com` |
 | `DEBUG` | `true` | Set to `false` in production |
 
 ### Optional (have sensible defaults)

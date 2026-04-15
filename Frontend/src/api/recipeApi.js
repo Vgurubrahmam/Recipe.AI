@@ -1,7 +1,7 @@
 // src/api/recipeApi.js
 // Native fetch-based API client — no external dependencies.
 
-const BASE_URL = '/api/v1'
+const BASE_URL = 'https://recipe-ai-1-fc1o.onrender.com/api/v1'
 
 /**
  * Normalise error responses from the FastAPI backend.
