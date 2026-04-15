@@ -1,7 +1,9 @@
 // src/api/recipeApi.js
 // Native fetch-based API client — no external dependencies.
+// In dev:  VITE_API_URL is unset → uses Vite proxy (/api → localhost:8000)
+// In prod: set VITE_API_URL=https://your-backend.onrender.com/api/v1
 
-const BASE_URL = 'https://recipe-ai-1-fc1o.onrender.com/api/v1'
+const BASE_URL = import.meta.env.VITE_API_URL || '/api/v1'
 
 /**
  * Normalise error responses from the FastAPI backend.

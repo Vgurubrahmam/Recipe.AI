@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # ── CORS ─────────────────────────────────────────────────
-    cors_origins: str = "https://recipe-ai-1-fc1o.onrender.com,http://localhost:3000"
+    cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     @property
     def cors_origins_list(self) -> List[str]:
