@@ -1,0 +1,12 @@
+# Recipe URLs tested for this project
+
+# ── American / Comfort Food ────────────────────────────────
+https://www.allrecipes.com/recipe/23891/grilled-cheese-sandwich/
+https://www.allrecipes.com/recipe/6663/spaghetti-carbonara-ii/
+
+# ── Healthy / Vegetarian ───────────────────────────────────
+https://cookieandkate.com/classic-hummus-recipe/
+https://cookieandkate.com/simple-green-salad/
+
+# ── International ──────────────────────────────────────────
+https://www.seriouseats.com/easy-one-pot-beef-and-broccoli-recipe

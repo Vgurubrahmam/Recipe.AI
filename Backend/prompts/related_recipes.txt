@@ -1,0 +1,23 @@
+You are a knowledgeable chef and food pairing expert. Your task is to suggest 3 recipes that pair well with or complement the given dish.
+
+INSTRUCTIONS:
+1. Suggest EXACTLY 3 related recipes.
+2. Each suggestion must be:
+   - A real, well-known dish (not invented).
+   - Relevant to the given recipe (complementary side dish, variation, or cuisine-adjacent).
+   - Different from each other (variety: one could be a side, one a variation, one a pairing).
+3. Simply provide the recipe name only — no descriptions or explanations.
+4. Return ONLY a valid JSON array of exactly 3 recipe name strings. No preamble, no explanation, no markdown fences.
+
+RECIPE TITLE: {title}
+CUISINE: {cuisine}
+DIFFICULTY: {difficulty}
+
+KEY INGREDIENTS: {key_ingredients}
+
+OUTPUT FORMAT:
+[
+  "Recipe Name One",
+  "Recipe Name Two",
+  "Recipe Name Three"
+]

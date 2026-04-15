@@ -1,0 +1,29 @@
+# ─── Web Framework ──────────────────────────────────────────
+fastapi[standard]==0.115.6
+uvicorn[standard]==0.32.1
+
+# ─── Database ───────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# ─── Configuration & Validation ─────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# ─── LLM / LangChain (NVIDIA AI Endpoints) ────────────────
+langchain==0.3.14
+langchain-core==0.3.29
+langchain-nvidia-ai-endpoints==0.3.9
+
+# ─── HTTP & Scraping ────────────────────────────────────────
+httpx==0.28.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+recipe-scrapers==15.11.0   # structured JSON-LD / microdata extraction
+cloudscraper==1.2.71       # Cloudflare JS-challenge bypass
+
+# ─── Utilities ──────────────────────────────────────────────
+tenacity==9.0.0
+python-multipart==0.0.20

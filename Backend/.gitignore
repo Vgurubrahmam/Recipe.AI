@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────
+# Secrets & Environment
+# ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ─────────────────────────────────────────────
+# Testing & Coverage
+# ─────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.coveragerc
+coverage.xml
+nosetests.xml
+
+# ─────────────────────────────────────────────
+# Type checking
+# ─────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+
+# ─────────────────────────────────────────────
+# Alembic generated (versions tracked, not cache)
+# ─────────────────────────────────────────────
+alembic/__pycache__/
+
+# ─────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────
+*.log
+logs/
+*.out
+
+# ─────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────
+*.db
+*.sqlite3
+*.sqlite
+
+# ─────────────────────────────────────────────
+# IDEs & Editors
+# ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─────────────────────────────────────────────
+# Docker
+# ─────────────────────────────────────────────
+# Keep docker-compose.yml tracked
+# Ignore local override files
+docker-compose.override.yml
+
+# ─────────────────────────────────────────────
+# Jupyter (if used for experimentation)
+# ─────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─────────────────────────────────────────────
+# Misc
+# ─────────────────────────────────────────────
+*.bak
+*.tmp
+.cache/

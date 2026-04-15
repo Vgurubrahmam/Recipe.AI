@@ -1,0 +1,45 @@
+You are an expert culinary data extractor. Your task is to parse the provided recipe blog content and extract a structured recipe JSON object.
+
+INSTRUCTIONS:
+1. Read the entire provided text carefully.
+2. Extract ONLY information explicitly present in the text — do NOT invent or hallucinate any values.
+3. For any field that is genuinely absent from the text, use null.
+4. Each ingredient MUST be split into three separate fields: quantity (numeric amount), unit (measurement unit), and item (the ingredient name without quantity or unit). If an ingredient has no unit (e.g., "2 eggs"), set unit to "".
+5. Instructions must be a numbered list of clean, complete step strings.
+6. Difficulty must be exactly one of: "easy", "medium", or "hard" — infer from complexity and time.
+7. Cuisine should be a single cuisine type (e.g., "Italian", "American", "Indian").
+8. TIME EXTRACTION — this is critical, follow ALL sub-rules:
+   a. Look for labels such as "Prep Time", "Prep:", "Preparation Time", "Active Time" → extract as `prep_time`.
+   b. Look for labels such as "Cook Time", "Cook:", "Cooking Time", "Bake Time", "Fry Time" → extract as `cook_time`.
+   c. Look for labels such as "Total Time", "Ready In", "Time:" → extract as `total_time`.
+   d. If `prep_time` AND `cook_time` are both found, set `total_time` = their sum if not already stated.
+   e. If only `total_time` is found and the recipe text mentions any active cooking step, set `cook_time` = `total_time` and set `prep_time` = "5 mins" as a reasonable minimum.
+   f. NEVER leave all three time fields as null if ANY time value appears anywhere in the text.
+   g. Format all times as human-readable strings: "5 mins", "30 mins", "1 hour 15 mins".
+9. Return ONLY a valid JSON object. No preamble, no explanation, no markdown fences.
+
+RECIPE CONTENT:
+{recipe_text}
+
+OUTPUT FORMAT (return this exact JSON structure, no extra keys, no markdown):
+{{
+  "title": "string or null",
+  "cuisine": "string or null",
+  "prep_time": "string or null  ← look for 'Prep Time', 'Preparation Time', 'Active Time'",
+  "cook_time": "string or null  ← look for 'Cook Time', 'Cooking Time', 'Bake Time'",
+  "total_time": "string or null  ← look for 'Total Time', 'Ready In'",
+  "servings": "integer or null  ← e.g. 4",
+  "difficulty": "easy | medium | hard",
+  "ingredients": [
+    {{"quantity": "string", "unit": "string", "item": "string"}},
+    ...
+  ],
+  "instructions": [
+    "Step 1: ...",
+    "Step 2: ...",
+    ...
+  ]
+}}
+
+IMPORTANT: prep_time and cook_time must NEVER both be null if any time information exists in the text.
+If the page only shows a total time (e.g. "15 minutes"), split it sensibly: set cook_time to the bulk of the time and prep_time to the remainder (minimum "5 mins").
