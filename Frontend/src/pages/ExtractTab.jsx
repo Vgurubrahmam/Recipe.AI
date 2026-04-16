@@ -30,10 +30,25 @@ function isNonRecipeUrl(url) {
   }
 }
 
+/**
+ * AllRecipes article-style URLs (missing /recipe/ in path) return HTTP 402
+ * to all automated scrapers, including headless browsers.
+ */
+function isAllRecipesArticleUrl(url) {
+  try {
+    const u = new URL(url)
+    return u.hostname.includes('allrecipes.com') && !u.pathname.startsWith('/recipe/')
+  } catch {
+    return false
+  }
+}
+
 const EXAMPLE_URLS = [
-  { site: 'AllRecipes', url: 'https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/' },
-  { site: 'Food.com', url: 'https://www.food.com/recipe/grilled-cheese-sandwich-14609' },
+  { site: 'Food.com',      url: 'https://www.food.com/recipe/grilled-cheese-sandwich-14609' },
   { site: 'SimplyRecipes', url: 'https://www.simplyrecipes.com/recipes/homemade_pizza/' },
+  { site: 'Tasty',         url: 'https://tasty.co/recipe/the-best-chocolate-chip-cookies' },
+  { site: 'SeriousEats',   url: 'https://www.seriouseats.com/the-best-chocolate-chip-cookies-recipe-chocolate' },
+  { site: 'AllRecipes ✓',  url: 'https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/' },
 ]
 
 export default function ExtractTab() {
@@ -42,12 +57,15 @@ export default function ExtractTab() {
   const [recipe, setRecipe]     = useState(null)
   const [error, setError]       = useState(null)
   const [urlWarning, setUrlWarning] = useState(null)
+  const [showDetails, setShowDetails] = useState(false)
 
   function handleUrlChange(e) {
     const val = e.target.value
     setUrl(val)
     if (val && isNonRecipeUrl(val)) {
       setUrlWarning('This looks like a gallery or listing page — please use a single recipe URL (e.g. /recipe/12345/name/).')
+    } else if (val && isAllRecipesArticleUrl(val)) {
+      setUrlWarning('AllRecipes article-style URLs (without /recipe/ in the path) are heavily bot-protected and may fail. Try the classic /recipe/… format.')
     } else {
       setUrlWarning(null)
     }
@@ -56,7 +74,7 @@ export default function ExtractTab() {
   async function handleSubmit(e) {
     e.preventDefault()
     if (!url.trim()) return
-    setLoading(true); setError(null); setRecipe(null)
+    setLoading(true); setError(null); setRecipe(null); setShowDetails(false)
     try {
       setRecipe(await extractRecipe(url.trim()))
     } catch (err) {
@@ -70,23 +88,43 @@ export default function ExtractTab() {
     try {
       const text = await navigator.clipboard.readText()
       setUrl(text)
-      setUrlWarning(isNonRecipeUrl(text) ? 'This looks like a gallery or listing page — please use a single recipe URL.' : null)
+      if (isNonRecipeUrl(text)) {
+        setUrlWarning('This looks like a gallery or listing page — please use a single recipe URL.')
+      } else if (isAllRecipesArticleUrl(text)) {
+        setUrlWarning('AllRecipes article-style URLs may be bot-protected. Try a /recipe/… URL instead.')
+      } else {
+        setUrlWarning(null)
+      }
     } catch {}
   }
 
-  function handleReset() { setUrl(''); setRecipe(null); setError(null); setUrlWarning(null) }
+  function handleReset() {
+    setUrl(''); setRecipe(null); setError(null); setUrlWarning(null); setShowDetails(false)
+  }
 
   function useExample(exUrl) {
-    setUrl(exUrl)
-    setUrlWarning(null)
-    setError(null)
-    setRecipe(null)
+    setUrl(exUrl); setUrlWarning(null); setError(null); setRecipe(null); setShowDetails(false)
   }
+
+  // ── Parse error for display ──────────────────────────────────
+  const isBlockError = error && (
+    error.includes('402') || error.includes('403') ||
+    error.includes('strategy') || error.includes('scraping') ||
+    error.includes('bot') || error.includes('paywall')
+  )
+
+  // Bullet-point failure lines (for collapsible technical details)
+  const errorBullets = error
+    ? error.split('\n').filter(l => l.trim().startsWith('•') || l.trim().startsWith('–'))
+    : []
+
+  // Show only the first line as the human-readable summary
+  const errorSummary = error ? error.split('\n')[0] : ''
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-6">
 
-      {/* Input Card */}
+      {/* ── Input Card ─────────────────────────────────────── */}
       <Card>
         <CardHeader>
           <div className="flex items-center gap-3">
@@ -109,7 +147,7 @@ export default function ExtractTab() {
                 type="url"
                 value={url}
                 onChange={handleUrlChange}
-                placeholder="https://www.allrecipes.com/recipe/12345/recipe-name/"
+                placeholder="https://www.food.com/recipe/12345/recipe-name"
                 disabled={loading}
                 className={`flex-1 h-11 text-base ${urlWarning ? 'border-amber-500/60 focus-visible:ring-amber-500/30' : ''}`}
                 autoFocus
@@ -128,7 +166,6 @@ export default function ExtractTab() {
               </Button>
             </div>
 
-            {/* URL warning */}
             {urlWarning && (
               <div className="flex items-start gap-2 text-xs text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
                 <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
@@ -156,7 +193,7 @@ export default function ExtractTab() {
             </div>
           </form>
 
-          {/* Example URLs */}
+          {/* Example URL chips (only when idle) */}
           {!recipe && !loading && !error && (
             <div className="pt-1 space-y-2">
               <p className="text-xs text-muted-foreground">Try a reliable example:</p>
@@ -173,33 +210,90 @@ export default function ExtractTab() {
                 ))}
               </div>
               <p className="text-[11px] text-muted-foreground/60">
-                ⚠️ allrecipes.com may block cloud server IPs — prefer food.com or simplyrecipes.com when deployed
+                ⚠️ AllRecipes article-style URLs may block automated scrapers — prefer food.com, simplyrecipes.com, or tasty.co
               </p>
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Loading skeleton */}
+      {/* ── Loading skeleton ────────────────────────────────── */}
       {loading && <LoadingSpinner />}
 
-      {/* Error */}
+      {/* ── Error card ──────────────────────────────────────── */}
       {error && !loading && (
         <Alert variant="destructive" className="animate-fade-in">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Extraction Failed</AlertTitle>
-          <AlertDescription className="mt-1 leading-relaxed space-y-2">
-            <p>{error}</p>
-            {(error.toLowerCase().includes('gallery') || error.toLowerCase().includes('strategy') || error.toLowerCase().includes('403') || error.toLowerCase().includes('402')) && (
+          <AlertDescription className="mt-1 space-y-3">
+
+            {/* Plain-English first line */}
+            <p className="leading-relaxed">{errorSummary}</p>
+
+            {/* AllRecipes article URL — targeted explanation */}
+            {isAllRecipesArticleUrl(url) && (
+              <div className="text-xs bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2 space-y-1">
+                <p className="font-semibold">⚠️ AllRecipes article-style URL detected</p>
+                <p className="opacity-80">
+                  This URL uses AllRecipes' newer article format (no <code>/recipe/</code> in the path),
+                  which returns <strong>HTTP 402</strong> to all automated scrapers — including headless browsers.
+                  Use the classic format instead:
+                </p>
+                <p className="font-mono opacity-70 text-[11px] break-all">
+                  https://www.allrecipes.com/recipe/&lt;id&gt;/&lt;recipe-name&gt;/
+                </p>
+              </div>
+            )}
+
+            {/* Generic bot-block hint */}
+            {isBlockError && !isAllRecipesArticleUrl(url) && (
               <p className="text-xs opacity-80">
-                💡 Make sure you're using a <strong>single recipe page</strong> URL (look for <code>/recipe/</code> in the URL), not a gallery, category, or search page.
+                💡 This site&apos;s bot-protection blocked all scraping attempts. Try one of the working examples below.
               </p>
             )}
+
+            {/* Collapsible technical strategy details */}
+            {errorBullets.length > 0 && (
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowDetails(d => !d)}
+                  className="text-xs underline underline-offset-2 opacity-70 hover:opacity-100 transition-opacity"
+                >
+                  {showDetails ? 'Hide' : 'Show'} technical details
+                </button>
+                {showDetails && (
+                  <ul className="mt-2 space-y-1">
+                    {errorBullets.map((line, i) => (
+                      <li key={i} className="text-[11px] font-mono opacity-70 leading-snug">{line.trim()}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {/* Working-example chips inline in error */}
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium opacity-80">Try a working URL instead:</p>
+              <div className="flex flex-wrap gap-1.5">
+                {EXAMPLE_URLS.map(({ site, url: exUrl }) => (
+                  <button
+                    key={site}
+                    type="button"
+                    onClick={() => { useExample(exUrl); setError(null) }}
+                    className="text-xs px-2.5 py-1 rounded-md bg-background/30 hover:bg-background/50 border border-destructive/30 hover:border-destructive/60 transition-colors"
+                  >
+                    {site}
+                  </button>
+                ))}
+              </div>
+            </div>
+
           </AlertDescription>
         </Alert>
       )}
 
-      {/* Result */}
+      {/* ── Recipe result ───────────────────────────────────── */}
       {recipe && !loading && <RecipeCard recipe={recipe} />}
     </div>
   )

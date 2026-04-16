@@ -5,28 +5,33 @@ Async web scraper for recipe blog pages.
 
 Strategy cascade (tried in order, first success wins):
 
-  1. recipe-scrapers (JSON-LD / microdata)
-     Uses the `recipe-scrapers` library which reads structured
-     Schema.org/Recipe markup embedded in the page.  Works on
-     the vast majority of modern recipe sites — including many
-     Cloudflare-protected ones — because the structured data is
-     rendered server-side. Returns a richly formatted text block.
+  1. httpx + recipe-scrapers (JSON-LD / microdata)
+     Fetches the page with realistic browser headers via httpx,
+     then runs `recipe-scrapers` to read structured Schema.org/Recipe
+     JSON-LD or microdata. Works on most modern recipe sites.
+     Falls back to raw BeautifulSoup text from the same fetch.
 
   2. cloudscraper (Cloudflare JS-challenge bypass)
-     Falls back to `cloudscraper` which emulates a real browser
-     TLS fingerprint to pass Cloudflare's JS challenge.  The
-     returned HTML is then parsed by BeautifulSoup exactly as in
-     strategy 3.
+     Emulates a real browser TLS fingerprint to pass Cloudflare's
+     JS challenge. Runs recipe-scrapers on the fetched HTML first,
+     then falls back to BeautifulSoup.
 
-  3. httpx + BeautifulSoup (plain HTML scraping)
-     Final fallback.  Sends realistic browser-like headers and
-     parses the raw HTML with BeautifulSoup.  Works fine for
-     sites without bot-detection.
+  3. Google Cache
+     Fetches the Google-cached version of the page via
+     webcache.googleusercontent.com. Bypasses paywalls and most
+     bot-detection because Google's cache is public HTML.  Works
+     for pages that return 402/403 to direct bots.
 
-All three strategies share the same URL validation and text
-cleaning utilities.  The first strategy that returns ≥ 150
-characters of cleaned text is used; if all three fail, a
-ScrapingError is raised with a combined diagnostic message.
+  4. Playwright headless browser
+     Full headless Chromium via Playwright. Executes JavaScript,
+     handles cookie banners, and waits for the DOM to settle.
+     Handles JS-only SPAs and the most aggressive bot-detection.
+     Requires `playwright` and `playwright install chromium`.
+
+All strategies share the same URL validation and text cleaning
+utilities. The first strategy that returns ≥ 150 characters of
+cleaned text is used; if all four fail, a ScrapingError is raised
+with a combined diagnostic message.
 """
 
 import asyncio
@@ -89,8 +94,10 @@ _NOISE_TAGS = [
 _MIN_TEXT_LENGTH = 150
 _BLOCK_PAGE_MARKERS = [
     "just a moment",
-    "cf-browser-verification",
-    "cloudflare",
+    "cf-browser-verification",   # Cloudflare challenge page div
+    "challenge-running",         # Cloudflare JS challenge body class
+    "cf_chl_opt",                # Cloudflare challenge JS variable
+    "ray id",                    # Cloudflare 403/503 error page footer
     "captcha",
     "access denied",
     "attention required",
@@ -201,7 +208,8 @@ def _detect_block_signals(status_code: int, html: str, headers: dict[str, str]) 
     signals: list[str] = []
     lower_html = html.lower()
 
-    if status_code in (403, 429, 503):
+    # 402 = Payment Required is used by AllRecipes and others to block bots
+    if status_code in (402, 403, 429, 503):
         signals.append(f"http_{status_code}")
 
     for marker in _BLOCK_PAGE_MARKERS:
@@ -426,14 +434,28 @@ async def _try_httpx(url: str) -> tuple[str, str]:
     for attempt in range(1, settings.scraper_max_retries + 1):
         headers = _build_headers(url)
         try:
-            async with httpx.AsyncClient(
-                headers=headers,
-                timeout=settings.scraper_request_timeout,
-                follow_redirects=True,
-                cookies={},
-                http2=True,
-            ) as client:
-                response = await client.get(url)
+            try:
+                async with httpx.AsyncClient(
+                    headers=headers,
+                    timeout=settings.scraper_request_timeout,
+                    follow_redirects=True,
+                    cookies={},
+                    http2=True,
+                ) as client:
+                    response = await client.get(url)
+            except ImportError:
+                logger.warning(
+                    "http2 extras not installed; falling back to HTTP/1.1 for %s",
+                    url,
+                )
+                async with httpx.AsyncClient(
+                    headers=headers,
+                    timeout=settings.scraper_request_timeout,
+                    follow_redirects=True,
+                    cookies={},
+                    http2=False,
+                ) as client:
+                    response = await client.get(url)
         except httpx.TimeoutException:
             if attempt < settings.scraper_max_retries:
                 await asyncio.sleep(settings.scraper_retry_backoff_base * (2 ** (attempt - 1)))
@@ -468,7 +490,8 @@ async def _try_httpx(url: str) -> tuple[str, str]:
         if response.status_code == 404:
             raise ScrapingError(f"Page not found (HTTP 404): {url}")
 
-        if response.status_code in (403, 429, 503) or last_signals:
+        # 402/403/429/503 or block signals — retry then fall through to next strategy
+        if response.status_code in (402, 403, 429, 503) or last_signals:
             if attempt < settings.scraper_max_retries:
                 retry_after = response_headers.get("retry-after")
                 try:
@@ -480,16 +503,9 @@ async def _try_httpx(url: str) -> tuple[str, str]:
                 await asyncio.sleep(delay)
                 continue
 
-            if response.status_code == 429:
-                raise ScrapingError(
-                    "Rate limited (HTTP 429) after retries. "
-                    "This is likely IP-based throttling on the cloud host."
-                )
-
-            # Let cloudscraper strategy run for access-denied patterns.
+            # Fall through to cloudscraper / Google Cache / Playwright
             logger.warning(
-                "httpx appears blocked for %s (status=%s, signals=%s). "
-                "Falling back to cloudscraper.",
+                "httpx blocked for %s (status=%s, signals=%s). Falling through to next strategy.",
                 url,
                 response.status_code,
                 ",".join(last_signals) if last_signals else "none",
@@ -505,9 +521,13 @@ async def _try_httpx(url: str) -> tuple[str, str]:
             )
 
         if response.status_code not in (200, 201):
-            raise ScrapingError(
-                f"Unexpected HTTP {response.status_code} from {url}"
+            # Treat unexpected non-success codes as soft failures so the next
+            # strategy can attempt the URL.
+            logger.warning(
+                "httpx got unexpected status %s for %s — falling through.",
+                response.status_code, url,
             )
+            return "", ""
 
         content_type = response_headers.get("content-type", "")
         if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -526,6 +546,146 @@ async def _try_httpx(url: str) -> tuple[str, str]:
 
 
 # ════════════════════════════════════════════════════════════
+# Strategy 3 — Google Cache
+# ════════════════════════════════════════════════════════════
+
+async def _try_google_cache(url: str) -> tuple[str, str]:
+    """
+    Fetch the Google-cached version of a URL.
+
+    Google's public web cache stores a snapshot of pages that is served
+    as plain HTML — bypassing paywalls, 402/403 bot-blocks, and JS
+    rendering requirements.  Useful for AllRecipes-style URLs that return
+    402 to direct scrapers.
+
+    Returns:
+        (html, extracted_text) tuple. Both empty strings on any failure.
+    """
+    cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}&hl=en"
+    logger.debug("Strategy 3 (Google Cache) fetching: %s", cache_url)
+    try:
+        headers = _build_headers(cache_url)
+        # Google cache works best without HTTP/2
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=settings.scraper_request_timeout,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(cache_url)
+
+        if response.status_code != 200:
+            logger.debug(
+                "Google Cache returned HTTP %d for %s", response.status_code, url
+            )
+            return "", ""
+
+        html = response.text or ""
+        # Strip Google's cache toolbar injected at the top
+        # (it lives inside a div with id="google-cache-hdr")
+        from bs4 import BeautifulSoup as _BS
+        soup = _BS(html, "lxml")
+        for hdr in soup.find_all(id="google-cache-hdr"):
+            hdr.decompose()
+        clean_html = str(soup)
+
+        text = _extract_text_from_html(clean_html)
+        return clean_html, text
+
+    except Exception as exc:
+        logger.debug("Google Cache failed for %s: %s", url, exc)
+        return "", ""
+
+
+# ════════════════════════════════════════════════════════════
+# Strategy 4 — Playwright headless browser
+# ════════════════════════════════════════════════════════════
+
+async def _try_playwright(url: str) -> tuple[str, str]:
+    """
+    Fetch a page using a full headless Chromium browser via Playwright.
+
+    Executes JavaScript, passes navigator checks, handles cookie banners
+    and waits for network idle before extracting content.  This is the
+    most reliable strategy for JS-heavy SPAs and sites with strict
+    bot-detection (e.g. AllRecipes article-style URLs).
+
+    Requires:
+        pip install playwright
+        playwright install chromium
+
+    Returns:
+        (html, extracted_text) tuple. Both empty strings if playwright
+        is not installed or the fetch fails.
+    """
+    try:
+        from playwright.async_api import async_playwright  # type: ignore
+    except ImportError:
+        logger.debug("playwright not installed — skipping Strategy 4")
+        return "", ""
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=random.choice(_USER_AGENTS),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                java_script_enabled=True,
+                # Mask common automation fingerprints
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+                    ),
+                },
+            )
+            page = await context.new_page()
+
+            # Hide webdriver property to avoid detection
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+
+            response = await page.goto(
+                url,
+                wait_until="networkidle",
+                timeout=settings.scraper_request_timeout * 1000,
+            )
+
+            if response is None or response.status not in (200, 201):
+                status = response.status if response else "none"
+                logger.debug(
+                    "Playwright got status %s for %s", status, url
+                )
+                await browser.close()
+                return "", ""
+
+            # Small delay to let lazy content load
+            await asyncio.sleep(1.5)
+
+            html = await page.content()
+            await browser.close()
+
+        text = _extract_text_from_html(html)
+        structured = _try_recipe_scrapers(url, html)
+        # Prefer structured data if available
+        final_text = structured if len(structured) >= _MIN_TEXT_LENGTH else text
+        return html, final_text
+
+    except Exception as exc:
+        logger.debug("Playwright failed for %s: %s", url, exc)
+        return "", ""
+
+
+# ════════════════════════════════════════════════════════════
 # Public interface
 # ════════════════════════════════════════════════════════════
 
@@ -533,12 +693,13 @@ async def scrape_url(url: str) -> str:
     """
     Fetch a recipe blog URL and extract its textual content.
 
-    Tries three strategies in order, returning the first result with
+    Tries four strategies in order, returning the first result with
     sufficient text content (≥ 150 characters):
 
-      1. recipe-scrapers — structured JSON-LD/microdata extraction
-      2. cloudscraper    — Cloudflare JS-challenge bypass
-      3. httpx           — plain async HTTP + BeautifulSoup
+      1. httpx + recipe-scrapers — structured JSON-LD/microdata
+      2. cloudscraper            — Cloudflare JS-challenge bypass
+      3. Google Cache            — public HTML cache (bypasses 402/403)
+      4. Playwright              — full headless Chromium browser
 
     Args:
         url: A valid http/https URL pointing to a recipe page.
@@ -548,7 +709,7 @@ async def scrape_url(url: str) -> str:
 
     Raises:
         ScrapingError: On invalid URL, persistent network errors, or when
-                       all three strategies return insufficient content.
+                       all four strategies return insufficient content.
     """
     _validate_url(url)
 
@@ -560,7 +721,7 @@ async def scrape_url(url: str) -> str:
     strategy_errors: list[str] = []
 
     # ── Strategy 1: httpx fetch → recipe-scrapers JSON-LD ───
-    logger.debug("Strategy 1 (recipe-scrapers) for %s", url)
+    logger.debug("Strategy 1 (httpx + recipe-scrapers) for %s", url)
     try:
         html, bs_text = await _try_httpx(url)
 
@@ -588,7 +749,7 @@ async def scrape_url(url: str) -> str:
             )
 
     except ScrapingError as exc:
-        # Network-level hard failures (404, timeout, etc.) bubble straight up
+        # Hard failures (404, timeout, redirect loop, network error) bubble up
         if any(
             keyword in exc.message
             for keyword in ("404", "timed out", "Too many redirects", "Network error",
@@ -602,7 +763,6 @@ async def scrape_url(url: str) -> str:
     cs_html, cs_text = await _try_cloudscraper(url)
 
     if cs_html:
-        # Try recipe-scrapers on the cloudscraper-fetched HTML first
         cs_structured = _try_recipe_scrapers(url, cs_html)
         if len(cs_structured) >= _MIN_TEXT_LENGTH:
             logger.info(
@@ -611,7 +771,6 @@ async def scrape_url(url: str) -> str:
             )
             return cs_structured
 
-        # Fall back to BeautifulSoup text from cloudscraper HTML
         if len(cs_text) >= _MIN_TEXT_LENGTH:
             logger.info(
                 "Strategy 2 (cloudscraper+BS4) succeeded: %d chars from %s",
@@ -625,19 +784,68 @@ async def scrape_url(url: str) -> str:
     else:
         strategy_errors.append("Strategy 2 (cloudscraper): returned no content.")
 
+    # ── Strategy 3: Google Cache ────────────────────────────
+    logger.info("Strategy 3 (Google Cache) for %s", url)
+    gc_html, gc_text = await _try_google_cache(url)
+
+    if gc_html:
+        gc_structured = _try_recipe_scrapers(url, gc_html)
+        if len(gc_structured) >= _MIN_TEXT_LENGTH:
+            logger.info(
+                "Strategy 3 (Google Cache + recipe-scrapers) succeeded: %d chars from %s",
+                len(gc_structured), url,
+            )
+            return gc_structured
+
+        if len(gc_text) >= _MIN_TEXT_LENGTH:
+            logger.info(
+                "Strategy 3 (Google Cache + BS4) succeeded: %d chars from %s",
+                len(gc_text), url,
+            )
+            return gc_text
+
+        strategy_errors.append(
+            f"Strategy 3 (Google Cache): returned only {len(gc_text)} chars."
+        )
+    else:
+        strategy_errors.append(
+            "Strategy 3 (Google Cache): no cached version available for this URL."
+        )
+
+    # ── Strategy 4: Playwright headless browser ─────────────
+    logger.info("Strategy 4 (Playwright) for %s", url)
+    pw_html, pw_text = await _try_playwright(url)
+
+    if pw_text and len(pw_text) >= _MIN_TEXT_LENGTH:
+        logger.info(
+            "Strategy 4 (Playwright) succeeded: %d chars from %s",
+            len(pw_text), url,
+        )
+        return pw_text
+
+    if pw_html:
+        strategy_errors.append(
+            f"Strategy 4 (Playwright): fetched HTML but extracted only {len(pw_text)} chars."
+        )
+    else:
+        strategy_errors.append(
+            "Strategy 4 (Playwright): not installed or browser launch failed. "
+            "Run: pip install playwright && playwright install chromium"
+        )
 
     error_summary = "\n".join(f"  • {e}" for e in strategy_errors)
     raise ScrapingError(
         f"Could not extract content from: {url}\n\n"
         f"All scraping strategies failed:\n{error_summary}\n\n"
         "The page may be:\n"
+        "  – Heavily bot-protected (requires a paid proxy or real browser)\n"
         "  – A JavaScript-only SPA (content loaded at runtime)\n"
-        "  – Behind a login / paywall\n"
+        "  – Behind a login or paywall\n"
         "  – Not a recipe page\n\n"
         "Try one of these reliably scrapable recipe URLs:\n"
-        "  • https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/\n"
         "  • https://www.food.com/recipe/grilled-cheese-sandwich-14609\n"
         "  • https://www.simplyrecipes.com/recipes/homemade_pizza/\n"
         "  • https://tasty.co/recipe/the-best-chocolate-chip-cookies\n"
-        "  • https://www.seriouseats.com/the-best-chocolate-chip-cookies-recipe-chocolate"
+        "  • https://www.seriouseats.com/the-best-chocolate-chip-cookies-recipe-chocolate\n"
+        "  • https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/"
     )
