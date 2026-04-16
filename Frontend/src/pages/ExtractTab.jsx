@@ -158,8 +158,8 @@ export default function ExtractTab() {
 
           {/* Example URLs */}
           {!recipe && !loading && !error && (
-            <div className="pt-1">
-              <p className="text-xs text-muted-foreground mb-2">Try an example:</p>
+            <div className="pt-1 space-y-2">
+              <p className="text-xs text-muted-foreground">Try a reliable example:</p>
               <div className="flex flex-wrap gap-2">
                 {EXAMPLE_URLS.map(({ site, url: exUrl }) => (
                   <button
@@ -172,6 +172,9 @@ export default function ExtractTab() {
                   </button>
                 ))}
               </div>
+              <p className="text-[11px] text-muted-foreground/60">
+                ⚠️ allrecipes.com may block cloud server IPs — prefer food.com or simplyrecipes.com when deployed
+              </p>
             </div>
           )}
         </CardContent>
