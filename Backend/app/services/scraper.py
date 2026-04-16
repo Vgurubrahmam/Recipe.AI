@@ -90,6 +90,21 @@ _NOISE_TAGS = [
     "meta", "link", "head", "advertisement", "ads",
 ]
 
+# ── Domains known to return 402/403 to ALL automated scrapers ──
+# For these we skip httpx + cloudscraper and go straight to Google Cache.
+_KNOWN_BLOCKED_DOMAINS = {
+    "allrecipes.com",
+    "www.allrecipes.com",
+}
+
+def _is_known_blocked(url: str) -> bool:
+    """Return True if the URL's hostname is in the known-blocked list."""
+    try:
+        return urlparse(url).hostname in _KNOWN_BLOCKED_DOMAINS
+    except Exception:
+        return False
+
+
 # ── Minimum text length to consider a scrape successful ─────
 _MIN_TEXT_LENGTH = 150
 _BLOCK_PAGE_MARKERS = [
@@ -490,8 +505,15 @@ async def _try_httpx(url: str) -> tuple[str, str]:
         if response.status_code == 404:
             raise ScrapingError(f"Page not found (HTTP 404): {url}")
 
-        # 402/403/429/503 or block signals — retry then fall through to next strategy
+        # 402/403/429/503 or block signals — fall through immediately (no retries on hard blocks)
         if response.status_code in (402, 403, 429, 503) or last_signals:
+            # 402 is a deliberate bot-block — retrying wastes time, skip immediately
+            if response.status_code == 402:
+                logger.warning(
+                    "httpx got 402 for %s — bot-blocked, skipping retries.", url
+                )
+                return "", ""
+
             if attempt < settings.scraper_max_retries:
                 retry_after = response_headers.get("retry-after")
                 try:
@@ -503,7 +525,6 @@ async def _try_httpx(url: str) -> tuple[str, str]:
                 await asyncio.sleep(delay)
                 continue
 
-            # Fall through to cloudscraper / Google Cache / Playwright
             logger.warning(
                 "httpx blocked for %s (status=%s, signals=%s). Falling through to next strategy.",
                 url,
@@ -562,10 +583,9 @@ async def _try_google_cache(url: str) -> tuple[str, str]:
         (html, extracted_text) tuple. Both empty strings on any failure.
     """
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}&hl=en"
-    logger.debug("Strategy 3 (Google Cache) fetching: %s", cache_url)
+    logger.debug("Google Cache fetching: %s", cache_url)
     try:
         headers = _build_headers(cache_url)
-        # Google cache works best without HTTP/2
         async with httpx.AsyncClient(
             headers=headers,
             timeout=settings.scraper_request_timeout,
@@ -580,16 +600,39 @@ async def _try_google_cache(url: str) -> tuple[str, str]:
             return "", ""
 
         html = response.text or ""
-        # Strip Google's cache toolbar injected at the top
-        # (it lives inside a div with id="google-cache-hdr")
+
+        # ── Clean Google's wrapper noise ─────────────────────
         from bs4 import BeautifulSoup as _BS
         soup = _BS(html, "lxml")
-        for hdr in soup.find_all(id="google-cache-hdr"):
-            hdr.decompose()
-        clean_html = str(soup)
 
-        text = _extract_text_from_html(clean_html)
-        return clean_html, text
+        # Remove Google-injected UI elements
+        for sel_id in ("google-cache-hdr", "cse", "gbqf"):
+            for tag in soup.find_all(id=sel_id):
+                tag.decompose()
+        for cls in ("action-bar-container", "result-stats"):
+            for tag in soup.find_all(class_=cls):
+                tag.decompose()
+
+        # ── Try recipe-scrapers on the raw cached HTML first ─
+        # Google preserves JSON-LD blocks, so structured data often works.
+        clean_html = str(soup)
+        structured = _try_recipe_scrapers(url, clean_html)
+        if len(structured) >= _MIN_TEXT_LENGTH:
+            logger.debug("Google Cache: recipe-scrapers succeeded (%d chars)", len(structured))
+            return clean_html, structured
+
+        # ── Build a title-prefixed text from BS4 ─────────────
+        # Prepend the page <h1> as "Title: …" so the LLM always has
+        # a clean title anchor even from noisy Google-cached HTML.
+        title_tag = soup.find("h1")
+        page_title = title_tag.get_text(strip=True) if title_tag else ""
+
+        bs4_text = _extract_text_from_html(clean_html)
+
+        if page_title and not bs4_text.startswith("Title:"):
+            bs4_text = f"Title: {page_title}\n{bs4_text}"
+
+        return clean_html, bs4_text
 
     except Exception as exc:
         logger.debug("Google Cache failed for %s: %s", url, exc)
@@ -712,94 +755,102 @@ async def scrape_url(url: str) -> str:
                        all four strategies return insufficient content.
     """
     _validate_url(url)
-
     logger.info("Scraping URL: %s", url)
 
-    # Small random jitter (0.3–1.0s) to avoid rate-limit fingerprinting
-    await asyncio.sleep(random.uniform(0.3, 1.0))
+    # Small random jitter (0.3–0.8s) to avoid rate-limit fingerprinting
+    await asyncio.sleep(random.uniform(0.3, 0.8))
 
     strategy_errors: list[str] = []
+    blocked_domain = _is_known_blocked(url)
 
-    # ── Strategy 1: httpx fetch → recipe-scrapers JSON-LD ───
-    logger.debug("Strategy 1 (httpx + recipe-scrapers) for %s", url)
-    try:
-        html, bs_text = await _try_httpx(url)
+    if blocked_domain:
+        logger.info(
+            "Known bot-blocking domain detected (%s) — skipping httpx/cloudscraper, "
+            "going straight to Google Cache.",
+            urlparse(url).hostname,
+        )
 
-        if html:
-            # First try structured data on the fetched HTML
-            structured_text = _try_recipe_scrapers(url, html)
-            if len(structured_text) >= _MIN_TEXT_LENGTH:
-                logger.info(
-                    "Strategy 1 (recipe-scrapers) succeeded: %d chars from %s",
-                    len(structured_text), url,
+    # ═══════════════════════════════════════════════════════
+    # Strategy 1: httpx + recipe-scrapers  (skip for blocked domains)
+    # ═══════════════════════════════════════════════════════
+    if not blocked_domain:
+        logger.debug("Strategy 1 (httpx + recipe-scrapers) for %s", url)
+        try:
+            html, bs_text = await _try_httpx(url)
+
+            if html:
+                structured_text = _try_recipe_scrapers(url, html)
+                if len(structured_text) >= _MIN_TEXT_LENGTH:
+                    logger.info(
+                        "Strategy 1 (recipe-scrapers) succeeded: %d chars from %s",
+                        len(structured_text), url,
+                    )
+                    return structured_text
+
+                if len(bs_text) >= _MIN_TEXT_LENGTH:
+                    logger.info(
+                        "Strategy 1 (httpx+BS4) succeeded: %d chars from %s",
+                        len(bs_text), url,
+                    )
+                    return bs_text
+
+                strategy_errors.append(
+                    "Strategy 1 (httpx+BS4): page returned too little text "
+                    f"({len(bs_text)} chars). Likely JavaScript-rendered."
                 )
-                return structured_text
 
-            # Fallback: use raw BeautifulSoup text from the same fetch
-            if len(bs_text) >= _MIN_TEXT_LENGTH:
+        except ScrapingError as exc:
+            if any(
+                keyword in exc.message
+                for keyword in ("404", "timed out", "Too many redirects",
+                                "Network error", "Expected HTML")
+            ):
+                raise
+            strategy_errors.append(f"Strategy 1 (httpx): {exc.message}")
+    else:
+        strategy_errors.append("Strategy 1 (httpx): skipped — known bot-blocking domain.")
+
+    # ═══════════════════════════════════════════════════════
+    # Strategy 2: cloudscraper  (skip for blocked domains)
+    # ═══════════════════════════════════════════════════════
+    if not blocked_domain:
+        logger.info("Strategy 2 (cloudscraper) for %s", url)
+        cs_html, cs_text = await _try_cloudscraper(url)
+
+        if cs_html:
+            cs_structured = _try_recipe_scrapers(url, cs_html)
+            if len(cs_structured) >= _MIN_TEXT_LENGTH:
                 logger.info(
-                    "Strategy 1 (httpx+BS4) succeeded: %d chars from %s",
-                    len(bs_text), url,
+                    "Strategy 2 (cloudscraper+recipe-scrapers) succeeded: %d chars from %s",
+                    len(cs_structured), url,
                 )
-                return bs_text
+                return cs_structured
+
+            if len(cs_text) >= _MIN_TEXT_LENGTH:
+                logger.info(
+                    "Strategy 2 (cloudscraper+BS4) succeeded: %d chars from %s",
+                    len(cs_text), url,
+                )
+                return cs_text
 
             strategy_errors.append(
-                "Strategy 1 (httpx+BS4): page returned too little text "
-                f"({len(bs_text)} chars). Likely JavaScript-rendered."
+                f"Strategy 2 (cloudscraper): returned only {len(cs_text)} chars."
             )
-
-    except ScrapingError as exc:
-        # Hard failures (404, timeout, redirect loop, network error) bubble up
-        if any(
-            keyword in exc.message
-            for keyword in ("404", "timed out", "Too many redirects", "Network error",
-                            "Expected HTML")
-        ):
-            raise
-        strategy_errors.append(f"Strategy 1 (httpx): {exc.message}")
-
-    # ── Strategy 2: cloudscraper (Cloudflare bypass) ───────
-    logger.info("Strategy 2 (cloudscraper) for %s", url)
-    cs_html, cs_text = await _try_cloudscraper(url)
-
-    if cs_html:
-        cs_structured = _try_recipe_scrapers(url, cs_html)
-        if len(cs_structured) >= _MIN_TEXT_LENGTH:
-            logger.info(
-                "Strategy 2 (cloudscraper+recipe-scrapers) succeeded: %d chars from %s",
-                len(cs_structured), url,
-            )
-            return cs_structured
-
-        if len(cs_text) >= _MIN_TEXT_LENGTH:
-            logger.info(
-                "Strategy 2 (cloudscraper+BS4) succeeded: %d chars from %s",
-                len(cs_text), url,
-            )
-            return cs_text
-
-        strategy_errors.append(
-            f"Strategy 2 (cloudscraper): returned only {len(cs_text)} chars."
-        )
+        else:
+            strategy_errors.append("Strategy 2 (cloudscraper): returned no content.")
     else:
-        strategy_errors.append("Strategy 2 (cloudscraper): returned no content.")
+        strategy_errors.append("Strategy 2 (cloudscraper): skipped — known bot-blocking domain.")
 
-    # ── Strategy 3: Google Cache ────────────────────────────
+    # ═══════════════════════════════════════════════════════
+    # Strategy 3: Google Cache  (always tried; first for blocked domains)
+    # ═══════════════════════════════════════════════════════
     logger.info("Strategy 3 (Google Cache) for %s", url)
     gc_html, gc_text = await _try_google_cache(url)
 
     if gc_html:
-        gc_structured = _try_recipe_scrapers(url, gc_html)
-        if len(gc_structured) >= _MIN_TEXT_LENGTH:
-            logger.info(
-                "Strategy 3 (Google Cache + recipe-scrapers) succeeded: %d chars from %s",
-                len(gc_structured), url,
-            )
-            return gc_structured
-
         if len(gc_text) >= _MIN_TEXT_LENGTH:
             logger.info(
-                "Strategy 3 (Google Cache + BS4) succeeded: %d chars from %s",
+                "Strategy 3 (Google Cache) succeeded: %d chars from %s",
                 len(gc_text), url,
             )
             return gc_text
@@ -812,7 +863,9 @@ async def scrape_url(url: str) -> str:
             "Strategy 3 (Google Cache): no cached version available for this URL."
         )
 
-    # ── Strategy 4: Playwright headless browser ─────────────
+    # ═══════════════════════════════════════════════════════
+    # Strategy 4: Playwright headless browser
+    # ═══════════════════════════════════════════════════════
     logger.info("Strategy 4 (Playwright) for %s", url)
     pw_html, pw_text = await _try_playwright(url)
 
