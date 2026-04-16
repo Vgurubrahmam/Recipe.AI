@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     # ── Scraper ──────────────────────────────────────────────
     scraper_max_text_length: int = 8000
     scraper_request_timeout: int = 30
+    scraper_max_retries: int = 3
+    scraper_retry_backoff_base: float = 0.8
+    scraper_enable_response_debug: bool = False
+    scraper_debug_snippet_length: int = 400
 
 
 @lru_cache()

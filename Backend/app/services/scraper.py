@@ -30,8 +30,10 @@ ScrapingError is raised with a combined diagnostic message.
 """
 
 import asyncio
+import hashlib
 import logging
 import random
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -85,6 +87,17 @@ _NOISE_TAGS = [
 
 # ── Minimum text length to consider a scrape successful ─────
 _MIN_TEXT_LENGTH = 150
+_BLOCK_PAGE_MARKERS = [
+    "just a moment",
+    "cf-browser-verification",
+    "cloudflare",
+    "captcha",
+    "access denied",
+    "attention required",
+    "verify you are human",
+    "robot check",
+    "bot detection",
+]
 
 
 # ════════════════════════════════════════════════════════════
@@ -179,6 +192,73 @@ def _extract_text_from_html(html: str) -> str:
 
     raw_text = content.get_text(separator="\n")
     return clean_text(raw_text, max_length=settings.scraper_max_text_length)
+
+
+def _detect_block_signals(status_code: int, html: str, headers: dict[str, str]) -> list[str]:
+    """
+    Detect anti-bot / WAF response indicators.
+    """
+    signals: list[str] = []
+    lower_html = html.lower()
+
+    if status_code in (403, 429, 503):
+        signals.append(f"http_{status_code}")
+
+    for marker in _BLOCK_PAGE_MARKERS:
+        if marker in lower_html:
+            signals.append(f"marker:{marker}")
+
+    return signals
+
+
+def _html_preview(html: str, max_len: int) -> str:
+    """
+    Build a compact single-line HTML preview for log comparison.
+    """
+    return " ".join(html[:max_len].split())
+
+
+def _log_fetch_diagnostics(
+    *,
+    strategy: str,
+    url: str,
+    attempt: int,
+    status_code: int,
+    final_url: str,
+    headers: dict[str, str],
+    html: str,
+) -> None:
+    """
+    Log status/header/body signatures for local vs cloud comparison.
+    """
+    content_type = headers.get("content-type", "")
+    server = headers.get("server", "")
+    via = headers.get("via", "")
+    html_hash = hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    block_signals = _detect_block_signals(status_code, html, headers)
+
+    logger.info(
+        "[scrape-diagnostic] strategy=%s attempt=%d status=%d final_url=%s len=%d hash=%s "
+        "content_type=%s server=%s via=%s block_signals=%s",
+        strategy,
+        attempt,
+        status_code,
+        final_url,
+        len(html),
+        html_hash,
+        content_type,
+        server,
+        via,
+        ",".join(block_signals) if block_signals else "none",
+    )
+
+    if settings.scraper_enable_response_debug:
+        logger.debug(
+            "[scrape-diagnostic-html] strategy=%s attempt=%d preview=%s",
+            strategy,
+            attempt,
+            _html_preview(html, settings.scraper_debug_snippet_length),
+        )
 
 
 # ════════════════════════════════════════════════════════════
@@ -282,21 +362,41 @@ async def _try_cloudscraper(url: str) -> tuple[str, str]:
         try:
             import cloudscraper  # type: ignore
 
-            cs = cloudscraper.create_scraper(
-                browser={
-                    "browser": "chrome",
-                    "platform": "windows",
-                    "mobile": False,
-                }
-            )
-            resp = cs.get(url, timeout=settings.scraper_request_timeout)
-            if resp.status_code != 200:
-                logger.debug(
-                    "cloudscraper got HTTP %d for %s", resp.status_code, url
+            for attempt in range(1, settings.scraper_max_retries + 1):
+                cs = cloudscraper.create_scraper(
+                    browser={
+                        "browser": "chrome",
+                        "platform": "windows",
+                        "mobile": False,
+                    }
                 )
-                return "", ""
-            html = resp.text
-            return html, _extract_text_from_html(html)
+                resp = cs.get(
+                    url,
+                    timeout=settings.scraper_request_timeout,
+                    headers=_build_headers(url),
+                )
+                html = resp.text or ""
+                headers = {k.lower(): v for k, v in resp.headers.items()}
+                _log_fetch_diagnostics(
+                    strategy="cloudscraper",
+                    url=url,
+                    attempt=attempt,
+                    status_code=resp.status_code,
+                    final_url=str(resp.url),
+                    headers=headers,
+                    html=html,
+                )
+
+                signals = _detect_block_signals(resp.status_code, html, headers)
+                if resp.status_code == 200 and not signals:
+                    return html, _extract_text_from_html(html)
+
+                if attempt < settings.scraper_max_retries:
+                    sleep_seconds = settings.scraper_retry_backoff_base * (2 ** (attempt - 1))
+                    time.sleep(sleep_seconds)
+
+            logger.debug("cloudscraper exhausted retries for %s", url)
+            return "", ""
         except Exception as exc:
             logger.debug("cloudscraper failed for %s: %s", url, exc)
             return "", ""
@@ -321,54 +421,108 @@ async def _try_httpx(url: str) -> tuple[str, str]:
         ScrapingError: On network-level errors that should surface to the user
                        (timeout, too many redirects, unexpected status codes).
     """
-    headers = _build_headers(url)
+    last_status: int | None = None
+    last_signals: list[str] = []
+    for attempt in range(1, settings.scraper_max_retries + 1):
+        headers = _build_headers(url)
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=settings.scraper_request_timeout,
+                follow_redirects=True,
+                cookies={},
+                http2=True,
+            ) as client:
+                response = await client.get(url)
+        except httpx.TimeoutException:
+            if attempt < settings.scraper_max_retries:
+                await asyncio.sleep(settings.scraper_retry_backoff_base * (2 ** (attempt - 1)))
+                continue
+            raise ScrapingError(
+                f"Request timed out after {settings.scraper_request_timeout}s. "
+                "The site may be slow or blocking automated access."
+            )
+        except httpx.TooManyRedirects:
+            raise ScrapingError(f"Too many redirects for URL: {url}")
+        except httpx.RequestError as exc:
+            if attempt < settings.scraper_max_retries:
+                await asyncio.sleep(settings.scraper_retry_backoff_base * (2 ** (attempt - 1)))
+                continue
+            raise ScrapingError(f"Network error while fetching '{url}': {exc}") from exc
 
-    try:
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=settings.scraper_request_timeout,
-            follow_redirects=True,
-            cookies={},
-        ) as client:
-            response = await client.get(url)
-
-    except httpx.TimeoutException:
-        raise ScrapingError(
-            f"Request timed out after {settings.scraper_request_timeout}s. "
-            "The site may be slow or blocking automated access."
+        html = response.text or ""
+        response_headers = {k.lower(): v for k, v in response.headers.items()}
+        last_status = response.status_code
+        _log_fetch_diagnostics(
+            strategy="httpx",
+            url=url,
+            attempt=attempt,
+            status_code=response.status_code,
+            final_url=str(response.url),
+            headers=response_headers,
+            html=html,
         )
-    except httpx.TooManyRedirects:
-        raise ScrapingError(f"Too many redirects for URL: {url}")
-    except httpx.RequestError as exc:
-        raise ScrapingError(f"Network error while fetching '{url}': {exc}") from exc
+        last_signals = _detect_block_signals(response.status_code, html, response_headers)
 
-    # HTTP error handling
-    if response.status_code == 404:
-        raise ScrapingError(f"Page not found (HTTP 404): {url}")
-    if response.status_code == 429:
-        raise ScrapingError(
-            "Rate limited (HTTP 429). The site is throttling requests. "
-            "Please wait a moment and try again."
-        )
-    if response.status_code == 403:
-        # Don't raise here — let cloudscraper handle it in strategy 2
-        logger.debug("httpx got 403 for %s — will try cloudscraper", url)
-        return "", ""
-    if response.status_code not in (200, 201):
-        raise ScrapingError(
-            f"Unexpected HTTP {response.status_code} from {url}"
-        )
+        # HTTP error handling
+        if response.status_code == 404:
+            raise ScrapingError(f"Page not found (HTTP 404): {url}")
 
-    content_type = response.headers.get("content-type", "")
-    if "text/html" not in content_type and "application/xhtml" not in content_type:
-        raise ScrapingError(
-            f"Expected HTML but received '{content_type}'. "
-            "This URL may point to a PDF, image, or API endpoint."
-        )
+        if response.status_code in (403, 429, 503) or last_signals:
+            if attempt < settings.scraper_max_retries:
+                retry_after = response_headers.get("retry-after")
+                try:
+                    delay = float(retry_after) if retry_after else (
+                        settings.scraper_retry_backoff_base * (2 ** (attempt - 1))
+                    )
+                except ValueError:
+                    delay = settings.scraper_retry_backoff_base * (2 ** (attempt - 1))
+                await asyncio.sleep(delay)
+                continue
 
-    html = response.text
-    text = _extract_text_from_html(html)
-    return html, text
+            if response.status_code == 429:
+                raise ScrapingError(
+                    "Rate limited (HTTP 429) after retries. "
+                    "This is likely IP-based throttling on the cloud host."
+                )
+
+            # Let cloudscraper strategy run for access-denied patterns.
+            logger.warning(
+                "httpx appears blocked for %s (status=%s, signals=%s). "
+                "Falling back to cloudscraper.",
+                url,
+                response.status_code,
+                ",".join(last_signals) if last_signals else "none",
+            )
+            return "", ""
+
+        if response.status_code >= 500:
+            if attempt < settings.scraper_max_retries:
+                await asyncio.sleep(settings.scraper_retry_backoff_base * (2 ** (attempt - 1)))
+                continue
+            raise ScrapingError(
+                f"Target site returned HTTP {response.status_code} after retries."
+            )
+
+        if response.status_code not in (200, 201):
+            raise ScrapingError(
+                f"Unexpected HTTP {response.status_code} from {url}"
+            )
+
+        content_type = response_headers.get("content-type", "")
+        if "text/html" not in content_type and "application/xhtml" not in content_type:
+            raise ScrapingError(
+                f"Expected HTML but received '{content_type}'. "
+                "This URL may point to a PDF, image, or API endpoint."
+            )
+
+        text = _extract_text_from_html(html)
+        return html, text
+
+    raise ScrapingError(
+        "Could not fetch page content after retries. "
+        f"Last status={last_status}, signals={','.join(last_signals) if last_signals else 'none'}."
+    )
 
 
 # ════════════════════════════════════════════════════════════
