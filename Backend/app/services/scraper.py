@@ -42,6 +42,7 @@ from urllib.parse import quote as _url_quote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from recipe_scrapers import scrape_html 
 
 from app.config import settings
 from app.middleware.error_handler import ScrapingError
