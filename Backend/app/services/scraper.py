@@ -8,30 +8,29 @@ Strategy cascade (tried in order, first success wins):
   1. httpx + recipe-scrapers (JSON-LD / microdata)
      Fetches the page with realistic browser headers via httpx,
      then runs `recipe-scrapers` to read structured Schema.org/Recipe
-     JSON-LD or microdata. Works on most modern recipe sites.
-     Falls back to raw BeautifulSoup text from the same fetch.
+     JSON-LD or microdata. Falls back to BeautifulSoup text.
 
   2. cloudscraper (Cloudflare JS-challenge bypass)
      Emulates a real browser TLS fingerprint to pass Cloudflare's
-     JS challenge. Runs recipe-scrapers on the fetched HTML first,
-     then falls back to BeautifulSoup.
+     JS challenge. Runs recipe-scrapers on the fetched HTML first.
 
-  3. Google Cache
-     Fetches the Google-cached version of the page via
-     webcache.googleusercontent.com. Bypasses paywalls and most
-     bot-detection because Google's cache is public HTML.  Works
-     for pages that return 402/403 to direct bots.
+  3. Bing Cache
+     Fetches the Bing-cached version of the page via cc.bingj.com.
+     Bypasses paywalls and most bot-detection because Bing's cache
+     is plain public HTML. Google Cache was deprecated in Feb 2024.
 
-  4. Playwright headless browser
-     Full headless Chromium via Playwright. Executes JavaScript,
-     handles cookie banners, and waits for the DOM to settle.
-     Handles JS-only SPAs and the most aggressive bot-detection.
-     Requires `playwright` and `playwright install chromium`.
+  4. Wayback Machine (archive.org)
+     Fetches the latest archived snapshot from the Internet Archive.
+     Works even when Bing has no cache for the URL.
+
+  5. Playwright headless browser
+     Full headless Chromium. Executes JavaScript, waits for the DOM
+     to settle, and masks webdriver fingerprints.
+     Requires: pip install playwright && playwright install chromium
 
 All strategies share the same URL validation and text cleaning
 utilities. The first strategy that returns ≥ 150 characters of
-cleaned text is used; if all four fail, a ScrapingError is raised
-with a combined diagnostic message.
+cleaned text is used; if all five fail, a ScrapingError is raised.
 """
 
 import asyncio
@@ -39,7 +38,7 @@ import hashlib
 import logging
 import random
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -300,7 +299,6 @@ def _try_recipe_scrapers(url: str, html: str) -> str:
         Formatted recipe text block, or empty string on any failure.
     """
     try:
-        from recipe_scrapers import scrape_html
 
         scraper = scrape_html(html, org_url=url)
 
@@ -567,23 +565,24 @@ async def _try_httpx(url: str) -> tuple[str, str]:
 
 
 # ════════════════════════════════════════════════════════════
-# Strategy 3 — Google Cache
+# Strategy 3 — Bing Cache
 # ════════════════════════════════════════════════════════════
 
-async def _try_google_cache(url: str) -> tuple[str, str]:
+async def _try_bing_cache(url: str) -> tuple[str, str]:
     """
-    Fetch the Google-cached version of a URL.
+    Fetch the Bing-cached version of a URL via cc.bingj.com.
 
-    Google's public web cache stores a snapshot of pages that is served
-    as plain HTML — bypassing paywalls, 402/403 bot-blocks, and JS
-    rendering requirements.  Useful for AllRecipes-style URLs that return
-    402 to direct scrapers.
+    Google Cache was deprecated in February 2024 and now returns a
+    short "no longer available" page. Bing's cache is still live and
+    serves plain archived HTML — bypassing paywalls, 402/403 blocks,
+    and JS rendering for most recipe sites.
 
     Returns:
         (html, extracted_text) tuple. Both empty strings on any failure.
     """
-    cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}&hl=en"
-    logger.debug("Google Cache fetching: %s", cache_url)
+    encoded = _url_quote(url, safe="")
+    cache_url = f"https://cc.bingj.com/cache.aspx?q={encoded}&url={encoded}&mkt=en-US"
+    logger.debug("Bing Cache fetching: %s", cache_url)
     try:
         headers = _build_headers(cache_url)
         async with httpx.AsyncClient(
@@ -595,52 +594,125 @@ async def _try_google_cache(url: str) -> tuple[str, str]:
 
         if response.status_code != 200:
             logger.debug(
-                "Google Cache returned HTTP %d for %s", response.status_code, url
+                "Bing Cache returned HTTP %d for %s", response.status_code, url
             )
             return "", ""
 
         html = response.text or ""
 
-        # ── Clean Google's wrapper noise ─────────────────────
+        # Bing wraps the cached page in a thin toolbar <div> at top.
         from bs4 import BeautifulSoup as _BS
         soup = _BS(html, "lxml")
-
-        # Remove Google-injected UI elements
-        for sel_id in ("google-cache-hdr", "cse", "gbqf"):
-            for tag in soup.find_all(id=sel_id):
-                tag.decompose()
-        for cls in ("action-bar-container", "result-stats"):
-            for tag in soup.find_all(class_=cls):
-                tag.decompose()
-
-        # ── Try recipe-scrapers on the raw cached HTML first ─
-        # Google preserves JSON-LD blocks, so structured data often works.
+        for tag in soup.find_all(id="bingcache-toolbar"):
+            tag.decompose()
         clean_html = str(soup)
+
+        # Prefer structured JSON-LD from the cached HTML
         structured = _try_recipe_scrapers(url, clean_html)
         if len(structured) >= _MIN_TEXT_LENGTH:
-            logger.debug("Google Cache: recipe-scrapers succeeded (%d chars)", len(structured))
+            logger.debug("Bing Cache: recipe-scrapers succeeded (%d chars)", len(structured))
             return clean_html, structured
 
-        # ── Build a title-prefixed text from BS4 ─────────────
-        # Prepend the page <h1> as "Title: …" so the LLM always has
-        # a clean title anchor even from noisy Google-cached HTML.
+        # Prepend <h1> as "Title:" so LLM always has a title anchor
         title_tag = soup.find("h1")
         page_title = title_tag.get_text(strip=True) if title_tag else ""
-
         bs4_text = _extract_text_from_html(clean_html)
-
         if page_title and not bs4_text.startswith("Title:"):
             bs4_text = f"Title: {page_title}\n{bs4_text}"
 
         return clean_html, bs4_text
 
     except Exception as exc:
-        logger.debug("Google Cache failed for %s: %s", url, exc)
+        logger.debug("Bing Cache failed for %s: %s", url, exc)
         return "", ""
 
 
 # ════════════════════════════════════════════════════════════
-# Strategy 4 — Playwright headless browser
+# Strategy 4 — Wayback Machine (archive.org)
+# ════════════════════════════════════════════════════════════
+
+async def _try_wayback(url: str) -> tuple[str, str]:
+    """
+    Fetch the latest Internet Archive (Wayback Machine) snapshot.
+
+    Two-step process:
+      1. Call the Wayback availability API to find the most recent snapshot.
+      2. Fetch the raw snapshot HTML (using the /if/ endpoint which serves
+         the original HTML without the Wayback toolbar).
+
+    Returns:
+        (html, extracted_text) tuple. Both empty strings on any failure.
+    """
+    avail_url = f"https://archive.org/wayback/available?url={url}"
+    logger.debug("Wayback Machine availability check: %s", avail_url)
+    try:
+        async with httpx.AsyncClient(
+            timeout=15,
+            follow_redirects=True,
+        ) as client:
+            avail_resp = await client.get(avail_url)
+
+        if avail_resp.status_code != 200:
+            logger.debug("Wayback availability API returned %d", avail_resp.status_code)
+            return "", ""
+
+        data = avail_resp.json()
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if not snapshot.get("available"):
+            logger.debug("Wayback Machine: no snapshot available for %s", url)
+            return "", ""
+
+        # Use /if/ to get raw original HTML without the Wayback toolbar
+        snapshot_url = snapshot["url"].replace(
+            "web.archive.org/web/", "web.archive.org/web/"
+        )
+        # Insert /if/ flag: .../web/20240101120000/https://...
+        #                → .../web/20240101120000if_/https://...
+        snapshot_url = snapshot_url.replace("/web/", "/web/", 1)
+        if "/if_/" not in snapshot_url:
+            snapshot_url = snapshot_url.replace(
+                "/web/" + snapshot["timestamp"] + "/",
+                "/web/" + snapshot["timestamp"] + "if_/",
+            )
+
+        logger.debug("Wayback Machine fetching snapshot: %s", snapshot_url)
+        headers = _build_headers(snapshot_url)
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=settings.scraper_request_timeout,
+            follow_redirects=True,
+        ) as client:
+            snap_resp = await client.get(snapshot_url)
+
+        if snap_resp.status_code != 200:
+            logger.debug("Wayback snapshot returned HTTP %d", snap_resp.status_code)
+            return "", ""
+
+        html = snap_resp.text or ""
+
+        # Prefer structured data from the archived HTML
+        structured = _try_recipe_scrapers(url, html)
+        if len(structured) >= _MIN_TEXT_LENGTH:
+            logger.debug("Wayback Machine: recipe-scrapers succeeded (%d chars)", len(structured))
+            return html, structured
+
+        from bs4 import BeautifulSoup as _BS
+        soup = _BS(html, "lxml")
+        title_tag = soup.find("h1")
+        page_title = title_tag.get_text(strip=True) if title_tag else ""
+        bs4_text = _extract_text_from_html(html)
+        if page_title and not bs4_text.startswith("Title:"):
+            bs4_text = f"Title: {page_title}\n{bs4_text}"
+
+        return html, bs4_text
+
+    except Exception as exc:
+        logger.debug("Wayback Machine failed for %s: %s", url, exc)
+        return "", ""
+
+
+# ════════════════════════════════════════════════════════════
+# Strategy 5 — Playwright headless browser
 # ════════════════════════════════════════════════════════════
 
 async def _try_playwright(url: str) -> tuple[str, str]:
@@ -648,22 +720,21 @@ async def _try_playwright(url: str) -> tuple[str, str]:
     Fetch a page using a full headless Chromium browser via Playwright.
 
     Executes JavaScript, passes navigator checks, handles cookie banners
-    and waits for network idle before extracting content.  This is the
-    most reliable strategy for JS-heavy SPAs and sites with strict
-    bot-detection (e.g. AllRecipes article-style URLs).
+    and waits for network idle before extracting content.
 
     Requires:
         pip install playwright
-        playwright install chromium
+        playwright install chromium   # downloads ~130 MB Chromium binary
 
     Returns:
-        (html, extracted_text) tuple. Both empty strings if playwright
-        is not installed or the fetch fails.
+        (html, extracted_text, error_detail) tuple.
+        html and text are empty strings on any failure;
+        error_detail carries a human-readable reason.
     """
     try:
         from playwright.async_api import async_playwright  # type: ignore
     except ImportError:
-        logger.debug("playwright not installed — skipping Strategy 4")
+        logger.warning("playwright package not installed — skipping Strategy 5")
         return "", ""
 
     try:
@@ -674,6 +745,7 @@ async def _try_playwright(url: str) -> tuple[str, str]:
                     "--no-sandbox",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
+                    "--disable-gpu",
                 ],
             )
             context = await browser.new_context(
@@ -681,7 +753,6 @@ async def _try_playwright(url: str) -> tuple[str, str]:
                 viewport={"width": 1280, "height": 800},
                 locale="en-US",
                 java_script_enabled=True,
-                # Mask common automation fingerprints
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept": (
@@ -691,40 +762,35 @@ async def _try_playwright(url: str) -> tuple[str, str]:
                 },
             )
             page = await context.new_page()
-
-            # Hide webdriver property to avoid detection
             await page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
 
             response = await page.goto(
                 url,
-                wait_until="networkidle",
+                wait_until="domcontentloaded",   # faster than networkidle
                 timeout=settings.scraper_request_timeout * 1000,
             )
 
             if response is None or response.status not in (200, 201):
                 status = response.status if response else "none"
-                logger.debug(
-                    "Playwright got status %s for %s", status, url
-                )
+                logger.warning("Playwright got HTTP %s for %s", status, url)
                 await browser.close()
                 return "", ""
 
-            # Small delay to let lazy content load
-            await asyncio.sleep(1.5)
-
+            await asyncio.sleep(2)   # let lazy JS content settle
             html = await page.content()
             await browser.close()
 
-        text = _extract_text_from_html(html)
         structured = _try_recipe_scrapers(url, html)
-        # Prefer structured data if available
-        final_text = structured if len(structured) >= _MIN_TEXT_LENGTH else text
-        return html, final_text
+        if len(structured) >= _MIN_TEXT_LENGTH:
+            return html, structured
+
+        text = _extract_text_from_html(html)
+        return html, text
 
     except Exception as exc:
-        logger.debug("Playwright failed for %s: %s", url, exc)
+        logger.warning("Playwright failed for %s: %s", url, exc)
         return "", ""
 
 
@@ -736,13 +802,17 @@ async def scrape_url(url: str) -> str:
     """
     Fetch a recipe blog URL and extract its textual content.
 
-    Tries four strategies in order, returning the first result with
+    Tries five strategies in order, returning the first result with
     sufficient text content (≥ 150 characters):
 
       1. httpx + recipe-scrapers — structured JSON-LD/microdata
       2. cloudscraper            — Cloudflare JS-challenge bypass
-      3. Google Cache            — public HTML cache (bypasses 402/403)
-      4. Playwright              — full headless Chromium browser
+      3. Bing Cache              — public HTML cache (bypasses 402/403)
+      4. Wayback Machine         — Internet Archive latest snapshot
+      5. Playwright              — full headless Chromium browser
+
+    Known bot-blocking domains (e.g. allrecipes.com) skip straight to
+    Strategy 3 to avoid wasting time on strategies that always fail.
 
     Args:
         url: A valid http/https URL pointing to a recipe page.
@@ -752,7 +822,7 @@ async def scrape_url(url: str) -> str:
 
     Raises:
         ScrapingError: On invalid URL, persistent network errors, or when
-                       all four strategies return insufficient content.
+                       all five strategies return insufficient content.
     """
     _validate_url(url)
     logger.info("Scraping URL: %s", url)
@@ -842,48 +912,68 @@ async def scrape_url(url: str) -> str:
         strategy_errors.append("Strategy 2 (cloudscraper): skipped — known bot-blocking domain.")
 
     # ═══════════════════════════════════════════════════════
-    # Strategy 3: Google Cache  (always tried; first for blocked domains)
+    # Strategy 3: Bing Cache  (first for blocked domains)
     # ═══════════════════════════════════════════════════════
-    logger.info("Strategy 3 (Google Cache) for %s", url)
-    gc_html, gc_text = await _try_google_cache(url)
+    logger.info("Strategy 3 (Bing Cache) for %s", url)
+    bc_html, bc_text = await _try_bing_cache(url)
 
-    if gc_html:
-        if len(gc_text) >= _MIN_TEXT_LENGTH:
+    if bc_html:
+        if len(bc_text) >= _MIN_TEXT_LENGTH:
             logger.info(
-                "Strategy 3 (Google Cache) succeeded: %d chars from %s",
-                len(gc_text), url,
+                "Strategy 3 (Bing Cache) succeeded: %d chars from %s",
+                len(bc_text), url,
             )
-            return gc_text
-
+            return bc_text
         strategy_errors.append(
-            f"Strategy 3 (Google Cache): returned only {len(gc_text)} chars."
+            f"Strategy 3 (Bing Cache): returned only {len(bc_text)} chars."
         )
     else:
         strategy_errors.append(
-            "Strategy 3 (Google Cache): no cached version available for this URL."
+            "Strategy 3 (Bing Cache): no cached version found."
         )
 
     # ═══════════════════════════════════════════════════════
-    # Strategy 4: Playwright headless browser
+    # Strategy 4: Wayback Machine (archive.org)
     # ═══════════════════════════════════════════════════════
-    logger.info("Strategy 4 (Playwright) for %s", url)
+    logger.info("Strategy 4 (Wayback Machine) for %s", url)
+    wb_html, wb_text = await _try_wayback(url)
+
+    if wb_html:
+        if len(wb_text) >= _MIN_TEXT_LENGTH:
+            logger.info(
+                "Strategy 4 (Wayback Machine) succeeded: %d chars from %s",
+                len(wb_text), url,
+            )
+            return wb_text
+        strategy_errors.append(
+            f"Strategy 4 (Wayback Machine): returned only {len(wb_text)} chars."
+        )
+    else:
+        strategy_errors.append(
+            "Strategy 4 (Wayback Machine): no archived snapshot available."
+        )
+
+    # ═══════════════════════════════════════════════════════
+    # Strategy 5: Playwright headless browser
+    # ═══════════════════════════════════════════════════════
+    logger.info("Strategy 5 (Playwright) for %s", url)
     pw_html, pw_text = await _try_playwright(url)
 
     if pw_text and len(pw_text) >= _MIN_TEXT_LENGTH:
         logger.info(
-            "Strategy 4 (Playwright) succeeded: %d chars from %s",
+            "Strategy 5 (Playwright) succeeded: %d chars from %s",
             len(pw_text), url,
         )
         return pw_text
 
     if pw_html:
         strategy_errors.append(
-            f"Strategy 4 (Playwright): fetched HTML but extracted only {len(pw_text)} chars."
+            f"Strategy 5 (Playwright): fetched HTML but extracted only {len(pw_text)} chars."
         )
     else:
         strategy_errors.append(
-            "Strategy 4 (Playwright): not installed or browser launch failed. "
-            "Run: pip install playwright && playwright install chromium"
+            "Strategy 5 (Playwright): browser launch failed — "
+            "run 'playwright install chromium' inside the venv."
         )
 
     error_summary = "\n".join(f"  • {e}" for e in strategy_errors)
